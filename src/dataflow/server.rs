@@ -139,6 +139,7 @@ pub enum SequencedCommand {
     /// Advance worker timestamp
     AdvanceSourceTimestamp {
         id: SourceInstanceId,
+        pid: i32,
         timestamp: Timestamp,
         offset: i64,
     },
@@ -236,7 +237,8 @@ where
     })
 }
 
-pub type TimestampHistories = Rc<RefCell<HashMap<SourceInstanceId, Vec<(Timestamp, i64)>>>>;
+pub type TimestampHistories =
+    Rc<RefCell<HashMap<SourceInstanceId, HashMap<i32, Vec<(Timestamp, i64)>>>>>;
 pub type TimestampChanges = Rc<
     RefCell<
         Vec<(
@@ -674,27 +676,30 @@ where
             }
             SequencedCommand::AdvanceSourceTimestamp {
                 id,
+                pid,
                 timestamp,
                 offset,
             } => {
                 let mut timestamps = self.ts_histories.borrow_mut();
                 if let Some(entries) = timestamps.get_mut(&id) {
-                    entries.push((timestamp, offset));
-                    let last_offset = if let Some(offs) = timestamps.get(&id).unwrap().last() {
-                        offs.1
-                    } else {
-                        -1
-                    };
-                    if last_offset == offset {
-                        // We only activate the Kakfa source if the offset is the same as the last
-                        // offset as new data already triggers the Kafka source's activation
-                        let source = self
-                            .ts_source_mapping
-                            .get(&id)
-                            .expect("Id should be present");
-                        if let Some(source) = source.upgrade() {
-                            if let Some(token) = &*source {
-                                token.activate();
+                    if let Some(ts) = entries.get_mut(&pid) {
+                        let last_offset = if let Some(offs) = ts.last() {
+                            offs.1
+                        } else {
+                            -1
+                        };
+                        ts.push((timestamp, offset));
+                        if last_offset == offset {
+                            // We only activate the Kakfa source if the offset is the same as the last
+                            // offset as new data already triggers the Kafka source's activation
+                            let source = self
+                                .ts_source_mapping
+                                .get(&id)
+                                .expect("Id should be present");
+                            if let Some(source) = source.upgrade() {
+                                if let Some(token) = &*source {
+                                    token.activate();
+                                }
                             }
                         }
                     }

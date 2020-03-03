@@ -58,6 +58,7 @@ pub enum Message {
     Worker(WorkerFeedbackWithMeta),
     AdvanceSourceTimestamp {
         id: SourceInstanceId,
+        pid: i32,
         timestamp: u64,
         offset: i64,
     },
@@ -522,6 +523,7 @@ where
 
                 Message::AdvanceSourceTimestamp {
                     id,
+                    pid,
                     timestamp,
                     offset,
                 } => {
@@ -529,6 +531,7 @@ where
                         &mut self.broadcast_tx,
                         SequencedCommand::AdvanceSourceTimestamp {
                             id,
+                            pid,
                             timestamp,
                             offset,
                         },

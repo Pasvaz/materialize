@@ -18,7 +18,6 @@ use rusoto_kinesis::{
     GetShardIteratorInput, GetShardIteratorOutput, Kinesis, KinesisClient, ListShardsInput,
     ListShardsOutput,
 };
-
 use dataflow_types::{Consistency, ExternalSourceConnector, KinesisSourceConnector, Timestamp};
 use expr::SourceInstanceId;
 use timely::dataflow::{Scope, Stream};
@@ -52,7 +51,9 @@ where
     // Putting source information on the Timestamp channel lets this
     // Dataflow worker communicate that it has created a source.
     let ts = if read_kinesis {
-        let prev = timestamp_histories.borrow_mut().insert(id.clone(), vec![]);
+        let prev = timestamp_histories
+            .borrow_mut()
+            .insert(id.clone(), HashMap::new());
         assert!(prev.is_none());
         timestamp_tx.as_ref().borrow_mut().push((
             id,

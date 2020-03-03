@@ -31,6 +31,8 @@ use expr::SourceInstanceId;
 
 use crate::coord;
 
+use itertools::Itertools;
+
 pub struct TimestampConfig {
     pub frequency: Duration,
     pub max_size: i64,
@@ -61,6 +63,8 @@ enum RtTimestampConnector {
 struct ByoTimestampConsumer {
     connector: ByoTimestampConnector,
     source_name: String,
+    last_partition_ts: HashMap<i32, u64>,
+    last_ts: u64,
 }
 
 enum ByoTimestampConnector {
@@ -124,7 +128,7 @@ fn byo_query_source(consumer: &mut ByoTimestampConsumer, max_increment_size: i64
 fn byo_extract_ts_update(
     consumer: &ByoTimestampConsumer,
     messages: Vec<Vec<u8>>,
-) -> Vec<(u64, i64)> {
+) -> Vec<(i32, u64, i64)> {
     let mut updates = vec![];
     for payload in messages {
         let st = str::from_utf8(&payload);
@@ -133,18 +137,25 @@ fn byo_extract_ts_update(
                 // Extract timestamp from payload
                 let split: Vec<&str> = timestamp.split(',').collect();
                 if split.len() != 3 {
-                    error!("incorrect payload format. Expected: SourceName/TS/Offset");
+                    error!("incorrect payload format. Expected: SourceName,PartitionId,TS,Offset");
                     continue;
                 }
                 let topic_name = String::from(split[0]);
-                let ts = match split[1].parse::<u64>() {
+                let partition = match split[1].parse::<i32>() {
                     Ok(i) => i,
                     Err(err) => {
                         error!("incorrect timestamp format {}", err);
                         continue;
                     }
                 };
-                let offset = match split[2].parse::<i64>() {
+                let ts = match split[2].parse::<u64>() {
+                    Ok(i) => i,
+                    Err(err) => {
+                        error!("incorrect timestamp format {}", err);
+                        continue;
+                    }
+                };
+                let offset = match split[3].parse::<i64>() {
                     Ok(i) => i,
                     Err(err) => {
                         error!("incorrect timestamp format {}", err);
@@ -152,7 +163,7 @@ fn byo_extract_ts_update(
                     }
                 };
                 if topic_name == consumer.source_name {
-                    updates.push((ts, offset))
+                    updates.push((partition, ts, offset))
                 }
             }
             Err(err) => error!("incorrect payload format: {}", err),
@@ -180,6 +191,28 @@ fn kafka_get_next_message(consumer: &mut BaseConsumer) -> Option<Vec<u8>> {
     } else {
         None
     }
+}
+
+/// Return the list of partition ids associated with a specific topic
+fn get_kafka_partitions(consumer: &BaseConsumer, topic: &str) -> Vec<i32> {
+    let mut partitions = vec![];
+    let result = consumer.fetch_metadata(Some(&topic), Duration::from_secs(1));
+    match result {
+        Ok(meta) => {
+            partitions = meta
+                .topics()
+                .first()
+                .unwrap()
+                .partitions()
+                .iter()
+                .map(|part| part.id())
+                .collect_vec();
+        }
+        Err(e) => {
+            error!("Failed to obtain partition information: {} {}", topic, e);
+        }
+    }
+    partitions
 }
 
 pub struct Timestamper {
@@ -270,10 +303,11 @@ impl Timestamper {
         let watermarks = self.rt_query_sources();
         self.rt_generate_next_timestamp();
         self.rt_persist_timestamp(&watermarks);
-        for (id, offset) in watermarks {
+        for (id, pid, offset) in watermarks {
             self.tx
                 .unbounded_send(coord::Message::AdvanceSourceTimestamp {
                     id,
+                    pid,
                     timestamp: self.current_timestamp,
                     offset,
                 })
@@ -326,19 +360,33 @@ impl Timestamper {
     }
 
     /// Implements the byo timestamping logic
+    /// A new timestamp should be
+    /// 1) strictly greater than the last timestamp in this partition
+    /// 2) greater or equal to all the timestamps that have been assigned so far across all partitions
     fn update_byo_timestamp(&mut self) {
         for (id, byo_consumer) in &mut self.byo_sources {
             // Get the next set of messages from the Consistency topic
             let messages = byo_query_source(byo_consumer, self.max_increment_size);
             // Notify coordinator of updates
-            for (timestamp, offset) in byo_extract_ts_update(byo_consumer, messages) {
-                self.tx
-                    .unbounded_send(coord::Message::AdvanceSourceTimestamp {
-                        id: *id,
-                        timestamp,
-                        offset,
-                    })
-                    .expect("Failed to send update to coordinator");
+            for (partition, timestamp, offset) in byo_extract_ts_update(byo_consumer, messages) {
+                let last_p_ts = match byo_consumer.last_partition_ts.get(&partition) {
+                    Some(ts) => *ts,
+                    None => 0,
+                };
+                if timestamp == 0 || timestamp < byo_consumer.last_ts || timestamp <= last_p_ts {
+                    error!("Timestamp cannot be equal to zero and timestamp assignment should increase monotonically");
+                } else {
+                    byo_consumer.last_ts = timestamp;
+                    byo_consumer.last_partition_ts.insert(partition, timestamp);
+                    self.tx
+                        .unbounded_send(coord::Message::AdvanceSourceTimestamp {
+                            id: *id,
+                            pid: partition,
+                            timestamp,
+                            offset,
+                        })
+                        .expect("Failed to send update to coordinator");
+                }
             }
         }
     }
@@ -445,6 +493,8 @@ impl Timestamper {
                     kc,
                     timestamp_topic,
                 )),
+                last_partition_ts: HashMap::new(),
+                last_ts: 0,
             },
             ExternalSourceConnector::File(fc) | ExternalSourceConnector::AvroOcf(fc) => {
                 error!("File sources are unsupported for timestamping");
@@ -455,6 +505,8 @@ impl Timestamper {
                         fc,
                         timestamp_topic,
                     )),
+                    last_partition_ts: HashMap::new(),
+                    last_ts: 0,
                 }
             }
             ExternalSourceConnector::Kinesis(kinc) => {
@@ -466,6 +518,8 @@ impl Timestamper {
                         kinc,
                         timestamp_topic,
                     )),
+                    last_partition_ts: HashMap::new(),
+                    last_ts: 0,
                 }
             }
         }
@@ -529,6 +583,11 @@ impl Timestamper {
             .consumer
             .subscribe(&[&consumer.timestamp_topic])
             .unwrap();
+
+        if get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic).len() != 1 {
+            error!("Consistency topic should contain a single partition");
+        }
+
         consumer
     }
 
@@ -540,16 +599,17 @@ impl Timestamper {
             .prepare("SELECT timestamp, offset FROM timestamps WHERE sid = ? AND vid = ? ORDER BY timestamp")
             .expect("Failed to execute select statement")
             .query_and_then(params![SqlVal(&id.sid), SqlVal(&id.vid)], |row| -> Result<_, failure::Error> {
-                let timestamp: SqlVal<u64> = row.get(0)?;
-                let offset: SqlVal<i64> = row.get(1)?;
-                Ok((timestamp.0, offset.0))
+                let pid: SqlVal<i32> = row.get(0)?;
+                let timestamp: SqlVal<u64> = row.get(1)?;
+                let offset: SqlVal<i64> = row.get(2)?;
+                Ok((pid.0, timestamp.0, offset.0))
             })
             .expect("Failed to parse SQL result")
             .collect();
 
         let mut max_offset = 0;
         for row in ts_updates {
-            let (timestamp, offset) = row.expect("Failed to parse SQL result");
+            let (pid, timestamp, offset) = row.expect("Failed to parse SQL result");
             max_offset = if offset > max_offset {
                 offset
             } else {
@@ -558,6 +618,7 @@ impl Timestamper {
             self.tx
                 .unbounded_send(coord::Message::AdvanceSourceTimestamp {
                     id,
+                    pid,
                     timestamp,
                     offset,
                 })
@@ -570,28 +631,36 @@ impl Timestamper {
     /// Set the new timestamped offset to min(max_offset, last_offset + increment_size): this ensures
     /// that we never create an overly large batch of messages for the same timestamp (which would
     /// prevent views from becoming visible in a timely fashion)
-    fn rt_query_sources(&mut self) -> Vec<(SourceInstanceId, i64)> {
+    fn rt_query_sources(&mut self) -> Vec<(SourceInstanceId, i32, i64)> {
         let mut result = vec![];
         for (id, cons) in self.rt_sources.iter_mut() {
             match &cons.connector {
                 RtTimestampConnector::Kafka(kc) => {
-                    let watermark =
-                        kc.consumer
-                            .fetch_watermarks(&kc.topic, 0, Duration::from_secs(1));
-                    match watermark {
-                        Ok(watermark) => {
-                            let high = watermark.1 - 1;
-                            // Bound the next timestamp to be no more than max_increment_size in the future
-                            let next_ts = if (high - cons.last_offset) > self.max_increment_size {
-                                cons.last_offset + self.max_increment_size
-                            } else {
-                                high
-                            };
-                            cons.last_offset = next_ts;
-                            result.push((*id, next_ts))
-                        }
-                        Err(e) => {
-                            error!("Failed to obtain Kafka Watermark Information: {} {}", id, e);
+                    let partitions = get_kafka_partitions(&kc.consumer, &kc.topic);
+
+                    for p in partitions {
+                        let watermark =
+                            kc.consumer
+                                .fetch_watermarks(&kc.topic, p, Duration::from_secs(1));
+                        match watermark {
+                            Ok(watermark) => {
+                                let high = watermark.1 - 1;
+                                // Bound the next timestamp to be no more than max_increment_size in the future
+                                let next_ts = if (high - cons.last_offset) > self.max_increment_size
+                                {
+                                    cons.last_offset + self.max_increment_size
+                                } else {
+                                    high
+                                };
+                                cons.last_offset = next_ts;
+                                result.push((*id, p, next_ts))
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to obtain Kafka Watermark Information: {} {}",
+                                    id, e
+                                );
+                            }
                         }
                     }
                 }
@@ -610,12 +679,12 @@ impl Timestamper {
 
     /// Persist timestamp updates to the underlying storage when using the
     /// real-time timestamping logic.
-    fn rt_persist_timestamp(&self, ts_updates: &[(SourceInstanceId, i64)]) {
+    fn rt_persist_timestamp(&self, ts_updates: &[(SourceInstanceId, i32, i64)]) {
         let storage = self.storage();
-        for (id, offset) in ts_updates {
+        for (id, pid, offset) in ts_updates {
             let mut stmt = storage
                 .prepare_cached(
-                    "INSERT INTO timestamps (sid, vid, timestamp, offset) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO timestamps (sid, vid, pid, timestamp, offset) VALUES (?, ?, ?, ?, ?)",
                 )
                 .expect(
                     "Failed to prepare insert statement into persistent store. \
@@ -624,6 +693,7 @@ impl Timestamper {
             while let Err(e) = stmt.execute(params![
                 SqlVal(&id.sid),
                 SqlVal(&id.vid),
+                SqlVal(&pid),
                 SqlVal(&self.current_timestamp),
                 SqlVal(&offset)
             ]) {

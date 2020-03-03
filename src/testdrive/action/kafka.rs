@@ -39,6 +39,7 @@ pub fn build_verify(mut cmd: BuiltinCommand) -> Result<VerifyAction, String> {
     let _format = cmd.args.string("format")?;
     let topic_prefix = cmd.args.string("topic")?;
     let schema = cmd.args.string("schema")?;
+
     let expected_messages = cmd.input;
 
     cmd.args.done()?;
@@ -161,6 +162,8 @@ fn get_values_in_first_list_not_in_second(
 
 pub struct IngestAction {
     topic_prefix: String,
+    partition: i32,
+    num_partition: i32,
     message_format: RawSchema,
     timestamp: Option<i64>,
     publish: bool,
@@ -202,6 +205,14 @@ enum ParsedSchema {
 pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
     let format = cmd.args.string("format")?;
     let topic_prefix = format!("testdrive-{}", cmd.args.string("topic")?);
+    let partition = match cmd.args.string("partition") {
+        Ok(partition) => partition.parse::<i32>().unwrap(),
+        Err(_e) => 0,
+    };
+    let num_partition = match cmd.args.string("num_partition") {
+        Ok(partition) => partition.parse::<i32>().unwrap(),
+        Err(_e) => 1,
+    };
     let message_format = match format.as_ref() {
         "avro" => {
             let schema = cmd.args.string("schema")?;
@@ -224,6 +235,8 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
     }
     Ok(IngestAction {
         topic_prefix,
+        partition,
+        num_partition,
         message_format,
         timestamp,
         publish,
@@ -307,7 +320,7 @@ impl IngestAction {
     fn do_redo(&self, state: &mut State) -> Result<(), String> {
         let topic_name = format!("{}-{}", self.topic_prefix, state.seed);
         println!("Ingesting data into Kafka topic {:?}", topic_name);
-        create_kafka_topic(&topic_name, &state)?;
+        create_kafka_topic(&topic_name, self.num_partition, &state)?;
 
         let format = match &self.message_format {
             RawSchema::Avro { key_schema, schema } => {
@@ -385,6 +398,7 @@ impl IngestAction {
             }
 
             let mut record: FutureRecord<&Vec<u8>, _> = FutureRecord::to(&topic_name).payload(&buf);
+            record = record.partition(self.partition);
             if let Some(timestamp) = self.timestamp {
                 record = record.timestamp(timestamp);
             }
@@ -407,7 +421,7 @@ impl Action for IngestAction {
     }
 }
 
-fn create_kafka_topic(topic_name: &str, state: &State) -> Result<(), String> {
+fn create_kafka_topic(topic_name: &str, num_partitions: i32, state: &State) -> Result<(), String> {
     // NOTE(benesch): it is critical that we invent a new topic name on
     // every testdrive run. We previously tried to delete and recreate the
     // topic with a fixed name, but ran into serious race conditions in
@@ -457,7 +471,6 @@ fn create_kafka_topic(topic_name: &str, state: &State) -> Result<(), String> {
     // strategy.
     //
     // [0]: https://github.com/confluentinc/confluent-kafka-python/issues/524#issuecomment-456783176
-    let num_partitions = 1;
     let new_topic = NewTopic::new(&topic_name, num_partitions, TopicReplication::Fixed(1))
         // Disabling retention is very important! Our testdrive tests
         // use hardcoded timestamps that are immediately eligible for
@@ -516,7 +529,7 @@ fn create_kafka_topic(topic_name: &str, state: &State) -> Result<(), String> {
             };
             if topic.partitions().is_empty() {
                 return Err("metadata fetch returned a topic with no partitions".to_string());
-            } else if topic.partitions().len() != 1 {
+            } else if topic.partitions().len() as i32 != num_partitions {
                 return Err(format!(
                     "topic {} was created with {} partitions when exactly one was expected",
                     topic_name,
