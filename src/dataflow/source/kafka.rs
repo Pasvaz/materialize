@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::iter::FromIterator;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use prometheus::{register_int_counter, IntCounter};
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::{ClientConfig, ClientContext};
 use rdkafka::{Message, Timestamp as KafkaTimestamp};
+use rdkafka::Offset::Offset;
 use timely::dataflow::operators::Capability;
 use timely::dataflow::{Scope, Stream};
 use timely::scheduling::activate::SyncActivator;
@@ -79,7 +81,6 @@ where
 
         let mut config = ClientConfig::new();
         config
-            .set("auto.offset.reset", "smallest")
             .set("group.id", &format!("materialize-{}", name))
             .set("enable.auto.commit", "false")
             .set("enable.partition.eof", "false")
@@ -112,27 +113,8 @@ where
             None
         };
 
-        let mut partitions: HashSet<i32> = HashSet::new();
-        if let Some(consumer) = consumer.as_mut() {
-            consumer.subscribe(&[&topic]).unwrap();
-            let result = consumer.fetch_metadata(Some(&topic), Duration::from_secs(1));
-            partitions = match result {
-                Ok(meta) => HashSet::from_iter(
-                    meta.topics()
-                        .first()
-                        .unwrap()
-                        .partitions()
-                        .iter()
-                        .map(|x| x.id())
-                        .collect_vec(),
-                ),
-                Err(e) => {
-                    error!("Failed to obtain partition information: {} {}", topic, e);
-                    HashSet::new()
-                }
-            }
-        }
-
+        // The next smallest timestamp that isn't closed
+        let mut last_closed_ts: u64 = 0;
         // Buffer place older for buffering messages for which we did not have a timestamp
         let mut buffer: Option<OwnedMessage> = None;
         // Index of the last offset that we have already processed for each partition
@@ -140,6 +122,23 @@ where
         // Records closed timestamps for each partition. It corresponds to smallest timestamp
         // that is still open for this partition
         let mut next_partition_ts: HashMap<i32, u64> = HashMap::new();
+        // The list of partitions for this topic
+        let mut partitions: HashSet<i32> = HashSet::new();
+        // The current number of partitions that we expect for this topic initially 1)
+        let mut expected_partition_count = 1;
+
+        if let Some(consumer) = consumer.as_mut() {
+            consumer.subscribe(&[&topic]).unwrap();
+            // Obtain initial information about partitions
+            partitions = update_partition_list(
+                consumer,
+                &topic,
+                &expected_partition_count,
+                &mut last_processed_offsets,
+                &mut next_partition_ts,
+                &last_closed_ts,
+            );
+        }
 
         move |cap, output| {
             // Accumulate updates to BYTES_READ_COUNTER;
@@ -151,13 +150,18 @@ where
                     let timer = std::time::Instant::now();
 
                     // Check if the capability can be downgraded (this is independent of whether
-                    // there are new messages that can be processed)
+                    // there are new messages that can be processed) as timestamps can become
+                    // closed in the absence of messages
                     downgrade_capability(
                         &id,
                         cap,
-                        &last_processed_offsets,
+                        &mut last_processed_offsets,
                         &mut next_partition_ts,
                         &timestamp_histories,
+                        &mut expected_partition_count,
+                        consumer,
+                        &topic,
+                        &mut last_closed_ts,
                     );
 
                     // Check if there was a message buffered and if we can now process it
@@ -180,17 +184,42 @@ where
                     while let Some(message) = next_message {
                         let payload = message.payload();
                         let partition = message.partition();
-                        let offset = message.offset();
+                        let offset = message.offset() + 1;
+
+                        if !partitions.contains(&partition) {
+                            // We have received a message for a partition for which we do not yet
+                            // have any metadata. Buffer the message and wait until we get the
+                            // necessary information
+                            partitions = update_partition_list(
+                                consumer,
+                                &topic,
+                                &expected_partition_count,
+                                &mut last_processed_offsets,
+                                &mut next_partition_ts,
+                                &last_closed_ts,
+                            );
+                            buffer = Some(message);
+                            activator.activate();
+                            return SourceStatus::Alive;
+                        }
+
+                        // Determine what the last processed message for this stream partition
                         let last_processed_offset = match last_processed_offsets.get(&partition) {
                             Some(offset) => *offset,
-                            None => -1,
+                            None => 0,
                         };
 
+                        // Determine the timestamp to which we need to assign this message
                         let ts =
                             find_matching_timestamp(&id, partition, offset, &timestamp_histories);
 
                         if offset <= last_processed_offset {
-                            error!("duplicate Kakfa message: souce {} (reading topic {}) received offset {} max processed offset {}", name, topic, offset, last_processed_offset);
+                            warn!("duplicate Kakfa message: souce {} (reading topic {}) received offset {} max processed offset {}", name, topic, offset, last_processed_offset);
+                            let res = consumer.seek(&topic, partition, Offset(last_processed_offset), Duration::from_secs(1));
+                            match res {
+                                Ok(_) => warn!("Fast-forwarding consumer on partition {} to offset {}", partition, last_processed_offset),
+                                Err(e) => error!("Failed to fast-forward consumer: {}", e)
+                            };
                             activator.activate();
                             return SourceStatus::Alive;
                         }
@@ -214,9 +243,13 @@ where
                                 downgrade_capability(
                                     &id,
                                     cap,
-                                    &last_processed_offsets,
+                                    &mut last_processed_offsets,
                                     &mut next_partition_ts,
                                     &timestamp_histories,
+                                    &mut expected_partition_count,
+                                    consumer,
+                                    &topic,
+                                    &mut last_closed_ts,
                                 );
                             }
                         }
@@ -326,6 +359,9 @@ where
 }
 
 /// For a given offset, returns an option type returning the matching timestamp or None
+/// if no timestamp can be assigned. The timestamp history contains a sequence of
+/// (timestamp, offset) tuples. A message with offset x will be assigned the first timestamp
+/// for which offset>=x.
 fn find_matching_timestamp(
     id: &SourceInstanceId,
     partition: i32,
@@ -336,7 +372,7 @@ fn find_matching_timestamp(
         None => None,
         Some(entries) => match entries.get(&partition) {
             Some(entries) => {
-                for (ts, max_offset) in entries {
+                for (_, ts, max_offset) in entries {
                     if offset <= *max_offset {
                         return Some(ts.clone());
                     }
@@ -346,6 +382,54 @@ fn find_matching_timestamp(
             None => None,
         },
     }
+}
+
+/// This function updates the list of partitions for a given topic
+/// and updates the appropriate metadata
+fn update_partition_list(
+    consumer: &BaseConsumer<GlueConsumerContext>,
+    topic: &str,
+    expected_partition_count: &i32,
+    last_processed_offsets: &mut HashMap<i32, i64>,
+    next_partition_ts: &mut HashMap<i32, u64>,
+    closed_ts: &u64,
+) -> HashSet<i32> {
+    let mut partitions = HashSet::new();
+
+    while i32::try_from(partitions.len()).unwrap() < *expected_partition_count {
+        let result = consumer.fetch_metadata(Some(&topic), Duration::from_secs(1));
+        partitions = match &result {
+            Ok(meta) => match meta.topics().iter().find(|t| t.name() == topic) {
+                Some(topic) => {
+                    HashSet::from_iter(topic.partitions().iter().map(|x| x.id()).collect_vec())
+                }
+                None => HashSet::new(),
+            },
+            Err(e) => {
+                error!("Failed to obtain partition information: {} {}", topic, e);
+                HashSet::new()
+            }
+        };
+    }
+
+    for p in &partitions {
+        // When a new timestamp is added, it will necessarily have a timestamp that is
+        // greater than the last closed timestamp. We therefore set the
+        if let None = next_partition_ts.get(p) {
+            next_partition_ts.insert(*p, *closed_ts);
+        }
+        // The last processed offset is always 0
+        if let None = last_processed_offsets.get(p) {
+            last_processed_offsets.insert(*p, 0);
+        }
+        match consumer.fetch_watermarks(&topic, *p, Duration::from_secs(1)) {
+            Ok(meta) => {
+                println!("Partition {} {} {}", p, meta.0, meta.1);
+            },
+            Err(_) => {}
+        }
+    }
+    partitions
 }
 
 /// Timestamp history map is of format [pid1: (ts1, offset1), (ts2, offset2), pid2: (ts1, offset)...].
@@ -365,9 +449,13 @@ fn find_matching_timestamp(
 fn downgrade_capability(
     id: &SourceInstanceId,
     cap: &mut Capability<Timestamp>,
-    last_processed_offset: &HashMap<i32, i64>,
+    last_processed_offset: &mut HashMap<i32, i64>,
     next_partition_ts: &mut HashMap<i32, u64>,
     timestamp_histories: &TimestampHistories,
+    current_partition_count: &mut i32,
+    consumer: &BaseConsumer<GlueConsumerContext>,
+    topic: &str,
+    last_closed_ts: &mut u64,
 ) {
     let mut changed = false;
     let mut min = std::u64::MAX;
@@ -376,7 +464,7 @@ fn downgrade_capability(
     // all messages that we are going to process for this timestamp across all partitions
     // In practice, the following happens:
     // Per partition, we iterate over the datastructure to remove (ts,offset) mappings for which
-    // we have seen all records <= offset. We keep track of the next "open" timestamp in that partition
+    // we have seen all records <= offset. We keep track of the last "closed" timestamp in that partition
     // in next_partition_ts
     match timestamp_histories.borrow_mut().get_mut(id) {
         None => {}
@@ -385,13 +473,29 @@ fn downgrade_capability(
                 // Obtain the last offset processed (or -1 if no messages have yet been processed)
                 let last_offset = match last_processed_offset.get(pid) {
                     Some(offs) => *offs,
-                    None => -1,
+                    None => 0,
                 };
                 // Check whether timestamps can be closed on this partition
-                while let Some((ts, offset)) = entries.first() {
-                    let next_ts = ts + 1;
+                while let Some((partition_count, ts, offset)) = entries.first() {
+                    if partition_count > current_partition_count {
+                        // A new partition has been added, we need to update the appropriate
+                        // entries before we continue. This will also update the last_processed_offset
+                        // and next_partition_ts datastructures
+                        update_partition_list(
+                            consumer,
+                            topic,
+                            current_partition_count,
+                            last_processed_offset,
+                            next_partition_ts,
+                            last_closed_ts,
+                        );
+                    }
                     if last_offset == *offset {
-                        next_partition_ts.insert(*pid, next_ts);
+                        // We have now seen all messages corresponding to this timestamp for this
+                        // partition. We
+                        // can close the timestamp (on this partition) and remove the associated metadata
+                        println!("Closing out ID: {} PID: {} TS: {}", id, pid, ts);
+                        next_partition_ts.insert(*pid, *ts);
                         entries.remove(0);
                         changed = true;
                     } else {
@@ -402,18 +506,18 @@ fn downgrade_capability(
             }
         }
     }
-    //  Next, we determine the minimum timestamp that is still open. This corresponds to the minimum
-    //  timestamp across partitions that is still open.  This corresponds to the minimum element in
-    // next_partition_ts
-    for (_, next_ts) in next_partition_ts {
+    //  Next, we determine the maximum timestamp that is fully closed. This corresponds to the minimum
+    //  timestamp across partitions. This value is stored in next_partition_ts
+    for (p, next_ts) in next_partition_ts {
         if *next_ts < min {
             min = *next_ts
         }
     }
-
-    // Downgrade capability to new minimum open timestamp
+    // Downgrade capability to new minimum open timestamp (which corresponds to min + 1).
     if changed {
-        cap.downgrade(&min);
+        println!("Fully Closed: {} ", min);
+        cap.downgrade(&(&min + 1));
+        *last_closed_ts = min;
     }
 }
 

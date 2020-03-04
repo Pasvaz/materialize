@@ -58,6 +58,7 @@ pub enum Message {
     Worker(WorkerFeedbackWithMeta),
     AdvanceSourceTimestamp {
         id: SourceInstanceId,
+        partition_count: i32,
         pid: i32,
         timestamp: u64,
         offset: i64,
@@ -523,6 +524,7 @@ where
 
                 Message::AdvanceSourceTimestamp {
                     id,
+                    partition_count,
                     pid,
                     timestamp,
                     offset,
@@ -531,6 +533,7 @@ where
                         &mut self.broadcast_tx,
                         SequencedCommand::AdvanceSourceTimestamp {
                             id,
+                            partition_count,
                             pid,
                             timestamp,
                             offset,
