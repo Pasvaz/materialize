@@ -644,13 +644,6 @@ impl Timestamper {
             .subscribe(&[&consumer.timestamp_topic])
             .unwrap();
 
-        // Ensure that customer will start from beginning of stream
-        /* let res = consumer.consumer.seek(&consumer.timestamp_topic, 0, Offset(0), Duration::from_secs(1));
-        match res {
-            Ok(_) => {},
-            Err(e) => error!("Failed to set customer position for topic {}: {}", consumer.timestamp_topic,e)
-        }; */
-
         if get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic).len() != 1 {
             error!("Consistency topic should contain a single partition");
         }

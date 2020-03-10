@@ -20,9 +20,9 @@ use lazy_static::lazy_static;
 use log::{error, warn};
 use prometheus::{register_int_counter, IntCounter};
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use rdkafka::Offset::Offset;
 use rdkafka::{ClientConfig, ClientContext};
 use rdkafka::{Message, Timestamp as KafkaTimestamp};
-use rdkafka::Offset::Offset;
 use timely::dataflow::operators::Capability;
 use timely::dataflow::{Scope, Stream};
 use timely::scheduling::activate::SyncActivator;
@@ -214,12 +214,20 @@ where
                             find_matching_timestamp(&id, partition, offset, &timestamp_histories);
 
                         if offset <= last_processed_offset {
-                            warn!("duplicate Kakfa message: souce {} (reading topic {}) received offset {} max processed offset {}", name, topic, offset, last_processed_offset);
-                            let res = consumer.seek(&topic, partition, Offset(last_processed_offset), Duration::from_secs(1));
+                            warn!("duplicate Kakfa message: souce {} (reading topic {}, partition {}) received offset {} max processed offset {}", name, topic, partition, offset, last_processed_offset);
+                            /* let res = consumer.seek(
+                                &topic,
+                                partition,
+                                Offset(last_processed_offset),
+                                Duration::from_secs(1),
+                            );
                             match res {
-                                Ok(_) => warn!("Fast-forwarding consumer on partition {} to offset {}", partition, last_processed_offset),
-                                Err(e) => error!("Failed to fast-forward consumer: {}", e)
-                            };
+                                Ok(_) => warn!(
+                                    "Fast-forwarding consumer on partition {} to offset {}",
+                                    partition, last_processed_offset
+                                ),
+                                Err(e) => error!("Failed to fast-forward consumer: {}", e),
+                            }; */
                             activator.activate();
                             return SourceStatus::Alive;
                         }
@@ -421,12 +429,6 @@ fn update_partition_list(
         // The last processed offset is always 0
         if let None = last_processed_offsets.get(p) {
             last_processed_offsets.insert(*p, 0);
-        }
-        match consumer.fetch_watermarks(&topic, *p, Duration::from_secs(1)) {
-            Ok(meta) => {
-                println!("Partition {} {} {}", p, meta.0, meta.1);
-            },
-            Err(_) => {}
         }
     }
     partitions
