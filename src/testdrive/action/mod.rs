@@ -293,6 +293,7 @@ pub fn create_state(config: &Config) -> Result<State, Error> {
         let mut config = ClientConfig::new();
         config.set("bootstrap.servers", &addr);
         config.set("group.id", "materialize-testdrive");
+        config.set("topic.metadata.refresh.interval.ms", "10");
 
         let admin: AdminClient<DefaultClientContext> =
             config.create().map_err(|e| Error::General {

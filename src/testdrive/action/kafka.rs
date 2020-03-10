@@ -16,13 +16,12 @@ use byteorder::{BigEndian, ByteOrder, NetworkEndian, WriteBytesExt};
 use futures::executor::block_on;
 use futures::stream::{FuturesUnordered, TryStreamExt};
 use futures::{future, StreamExt};
+use rdkafka::admin::NewPartitions;
 use rdkafka::admin::{NewTopic, TopicReplication};
 use rdkafka::consumer::Consumer;
 use rdkafka::error::RDKafkaError;
 use rdkafka::message::Message;
 use rdkafka::producer::FutureRecord;
-use rdkafka::admin::NewPartitions;
-use serde_json::Value as JsonValue;
 
 use ore::collections::CollectionExt;
 
@@ -320,8 +319,7 @@ impl IngestAction {
         let topic_name = format!("{}-{}", self.topic_prefix, state.seed);
         println!("Ingesting data into Kafka topic {:?}", topic_name);
         create_kafka_topic(&topic_name, self.num_partition, &state)?;
-        add_partitions(&topic_name, self.add_partition, &state);
-
+        add_partitions(&topic_name, self.add_partition, &state)?;
         let format = match &self.message_format {
             RawSchema::Avro { key_schema, schema } => {
                 let schema_id = if self.publish {
@@ -403,7 +401,6 @@ impl IngestAction {
             if let Some(timestamp) = self.timestamp {
                 record = record.timestamp(timestamp);
             }
-            println!("Writing record for {}", self.partition);
             futs.push(state.kafka_producer.send(record, 1000 /* block_ms */));
         }
         block_on(futs.try_for_each(|_| future::ok(()))).map_err(|e| e.to_string())
@@ -442,7 +439,7 @@ fn add_partitions(topic_name: &str, num_partitions: i32, state: &State) -> Resul
             ));
         }
         match res.into_element() {
-            Ok(_)  => Ok(()),
+            Ok(_) => Ok(()),
             Err((_, err)) => Err(err.to_string()),
         }?;
         // Topic creation is asynchronous, and if we don't wait for it to

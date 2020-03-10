@@ -7,9 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dataflow_types::{Consistency, ExternalSourceConnector, KinesisSourceConnector, Timestamp};
+use expr::SourceInstanceId;
 use futures::executor::block_on;
 use log::{error, warn};
 use rusoto_core::{HttpClient, RusotoError};
@@ -19,8 +21,6 @@ use rusoto_kinesis::{
     GetShardIteratorInput, GetShardIteratorOutput, Kinesis, KinesisClient, ListShardsInput,
     ListShardsOutput,
 };
-use dataflow_types::{Consistency, ExternalSourceConnector, KinesisSourceConnector, Timestamp};
-use expr::SourceInstanceId;
 use timely::dataflow::{Scope, Stream};
 
 use super::util::source;

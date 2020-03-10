@@ -18,6 +18,7 @@ use log::{error, info};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
+use rdkafka::Offset::Offset;
 use rusoto_core::HttpClient;
 use rusoto_credential::StaticProvider;
 use rusoto_kinesis::KinesisClient;
@@ -178,7 +179,6 @@ fn byo_extract_ts_update(
             Err(err) => error!("incorrect payload format: {}", err),
         }
     }
-    println!("Updates {}", updates.len());
     updates
 }
 
@@ -199,7 +199,6 @@ fn kafka_get_next_message(consumer: &mut BaseConsumer) -> Option<Vec<u8>> {
             }
         }
     } else {
-        println!("No new Kafka message");
         None
     }
 }
@@ -210,9 +209,7 @@ fn get_kafka_partitions(consumer: &BaseConsumer, topic: &str) -> Vec<i32> {
     let result = consumer.fetch_metadata(Some(&topic), Duration::from_secs(1));
     match &result {
         Ok(meta) => match meta.topics().iter().find(|t| t.name() == topic) {
-            Some(topic) => {
-               partitions = topic.partitions().iter().map(|x| x.id()).collect_vec()
-            }
+            Some(topic) => partitions = topic.partitions().iter().map(|x| x.id()).collect_vec(),
             None => {}
         },
         Err(e) => {
@@ -412,21 +409,32 @@ impl Timestamper {
                         // timestamps > the last closed timestamp. We need to explicitly close
                         // out all prior timestamps. To achieve this, we send an additional
                         // timestamp message to the coord/worker
-                        println!("Fast-forwarding stream {} {} {} {} {}", id, partition_count, partition_count-1, byo_consumer.last_ts, offset);
+                        println!(
+                            "Fast-forwarding stream {} {} {} {} {}",
+                            id,
+                            partition_count,
+                            partition_count - 1,
+                            byo_consumer.last_ts,
+                            offset
+                        );
                         self.tx
                             .unbounded_send(coord::Message::AdvanceSourceTimestamp {
                                 id: *id,
-                                partition_count, // The new partition count
+                                partition_count,          // The new partition count
                                 pid: partition_count - 1, // the ID of the new partition
                                 timestamp: byo_consumer.last_ts,
                                 offset: 0, // An offset of 0 will "fast-forward" the stream, it denotes
                                            // the empty interval
-                            }).expect("Failed to send update to coordinator");
+                            })
+                            .expect("Failed to send update to coordinator");
                     }
                     byo_consumer.current_partition_count = partition_count;
                     byo_consumer.last_ts = timestamp;
                     byo_consumer.last_partition_ts.insert(partition, timestamp);
-                    println!("Sending TS: {} {} {} {} {}", id, partition_count, partition, timestamp, offset);
+                    println!(
+                        "Sending TS: {} {} {} {} {}",
+                        id, partition_count, partition, timestamp, offset
+                    );
                     self.tx
                         .unbounded_send(coord::Message::AdvanceSourceTimestamp {
                             id: *id,
@@ -636,6 +644,13 @@ impl Timestamper {
             .subscribe(&[&consumer.timestamp_topic])
             .unwrap();
 
+        // Ensure that customer will start from beginning of stream
+        /* let res = consumer.consumer.seek(&consumer.timestamp_topic, 0, Offset(0), Duration::from_secs(1));
+        match res {
+            Ok(_) => {},
+            Err(e) => error!("Failed to set customer position for topic {}: {}", consumer.timestamp_topic,e)
+        }; */
+
         if get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic).len() != 1 {
             error!("Consistency topic should contain a single partition");
         }
@@ -725,7 +740,7 @@ impl Timestamper {
                 RtTimestampConnector::Kinesis(_kc) => {
                     // For now, always just push the current system timestamp.
                     // todo: Github issue #2219
-                    result.push((*id, 0,0,self.current_timestamp as i64));
+                    result.push((*id, 0, 0, self.current_timestamp as i64));
                 }
             }
         }
