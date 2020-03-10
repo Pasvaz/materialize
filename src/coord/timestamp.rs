@@ -725,7 +725,7 @@ impl Timestamper {
                 RtTimestampConnector::Kinesis(_kc) => {
                     // For now, always just push the current system timestamp.
                     // todo: Github issue #2219
-                    result.push((*id, self.current_timestamp as i64));
+                    result.push((*id, 0,0,self.current_timestamp as i64));
                 }
             }
         }

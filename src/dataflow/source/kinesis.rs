@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
 use futures::executor::block_on;
 use log::{error, warn};
