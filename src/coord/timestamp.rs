@@ -206,16 +206,18 @@ fn kafka_get_next_message(consumer: &mut BaseConsumer) -> Option<Vec<u8>> {
 /// Return the list of partition ids associated with a specific topic
 fn get_kafka_partitions(consumer: &BaseConsumer, topic: &str) -> Vec<i32> {
     let mut partitions = vec![];
-    let result = consumer.fetch_metadata(Some(&topic), Duration::from_secs(1));
-    match &result {
-        Ok(meta) => match meta.topics().iter().find(|t| t.name() == topic) {
-            Some(topic) => partitions = topic.partitions().iter().map(|x| x.id()).collect_vec(),
-            None => {}
-        },
-        Err(e) => {
-            error!("Failed to obtain partition information: {} {}", topic, e);
-        }
-    };
+    while partitions.len() == 0 {
+        let result = consumer.fetch_metadata(Some(&topic), Duration::from_secs(1));
+        match &result {
+            Ok(meta) => match meta.topics().iter().find(|t| t.name() == topic) {
+                Some(topic) => partitions = topic.partitions().iter().map(|x| x.id()).collect_vec(),
+                None => {}
+            },
+            Err(e) => {
+                error!("Failed to obtain partition information: {} {}", topic, e);
+            }
+        };
+    }
     partitions
 }
 
@@ -643,10 +645,13 @@ impl Timestamper {
             .subscribe(&[&consumer.timestamp_topic])
             .unwrap();
 
-        if get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic).len() != 1 {
-            error!("Consistency topic should contain a single partition");
+        let partitions = get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic);
+        if partitions.len() != 1 {
+            error!(
+                "Consistency topic should contain a single partition. Contains {}",
+                partitions.len()
+            );
         }
-
         consumer
     }
 

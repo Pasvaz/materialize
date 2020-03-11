@@ -215,7 +215,7 @@ where
 
                         if offset <= last_processed_offset {
                             warn!("duplicate Kakfa message: souce {} (reading topic {}, partition {}) received offset {} max processed offset {}", name, topic, partition, offset, last_processed_offset);
-                            /* let res = consumer.seek(
+                            let res = consumer.seek(
                                 &topic,
                                 partition,
                                 Offset(last_processed_offset),
@@ -227,7 +227,7 @@ where
                                     partition, last_processed_offset
                                 ),
                                 Err(e) => error!("Failed to fast-forward consumer: {}", e),
-                            }; */
+                            };
                             activator.activate();
                             return SourceStatus::Alive;
                         }
