@@ -483,11 +483,10 @@ impl Timestamper {
     ) -> RtKafkaConnector {
         let mut config = ClientConfig::new();
         config
-            .set("auto.offset.reset", "smallest")
+            .set("auto.offset.reset", "earliest")
             .set("group.id", &format!("materialize-rt-{}-{}", &kc.topic, id))
             .set("enable.auto.commit", "false")
             .set("enable.partition.eof", "false")
-            .set("auto.offset.reset", "earliest")
             .set("session.timeout.ms", "300000")
             .set("max.poll.interval.ms", "300000") // 5 minutes
             .set("fetch.message.max.bytes", "134217728")
